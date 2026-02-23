@@ -75,7 +75,7 @@
 <body class="bg-white dark:bg-gemini-dark text-gray-900 dark:text-gray-100 transition-colors duration-200">
 
     <div id="loading" class="flex items-center justify-center h-[100dvh] w-full text-lg font-semibold text-gray-500">
-        <i class="fa-solid fa-spinner fa-spin mr-3"></i> <span id="loading-text">Loading App...</span>
+        <i class="fa-solid fa-spinner fa-spin mr-3"></i> <span>Loading App...</span>
     </div>
 
     <div id="app" class="h-[100dvh] w-full">
@@ -177,26 +177,292 @@
     </div>
 
     <script>
-        // 1. FORCE THE APP TO SHOW IMMEDIATELY (Skip all waiting)
+        // 1. FORCIBLY SHOW UI IMMEDIATELY
         document.getElementById('loading').style.display = 'none';
         document.getElementById('app').style.display = 'flex';
 
-        // 2. Wrap all logic so a failure won't hide the UI again
-        try {
-            const DEFAULT_MODEL = "deepseek/deepseek-r1:free";
-            const API_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-            
-            let state = {
-                apiKey: '', model: DEFAULT_MODEL, systemPrompt: '', theme: 'light',
-                chats: [], currentChatId: null, isGenerating: false, abortController: null
-            };
+        // 2. STATE & CONSTANTS
+        const DEFAULT_MODEL = "deepseek/deepseek-r1:free";
+        const API_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
+        
+        let state = {
+            apiKey: '', model: DEFAULT_MODEL, systemPrompt: '', theme: 'light',
+            chats: [], currentChatId: null, isGenerating: false, abortController: null
+        };
 
-            // Setup Marked.js
-            if (typeof marked !== 'undefined') {
-                marked.setOptions({ breaks: true, gfm: true });
+        // 3. CORE UTILITY FUNCTIONS
+        function escapeHTML(str) { 
+            return (str || "").replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag])); 
+        }
+
+        function renderMarkdown(text) { 
+            try { return typeof marked !== 'undefined' ? marked.parse(text || "") : escapeHTML(text); } 
+            catch(e) { return escapeHTML(text); } 
+        }
+
+        function safeStorageGet(key) {
+            try { return localStorage.getItem(key); } catch(e) { return null; }
+        }
+
+        function safeStorageSet(key, val) {
+            try { localStorage.setItem(key, val); } catch(e) { console.warn("Local storage is disabled."); }
+        }
+
+        // 4. APP LOGIC FUNCTIONS
+        function loadState() {
+            const stored = safeStorageGet('universalAiChatState');
+            if (stored) {
+                try { state = { ...state, ...JSON.parse(stored) }; } catch(e) {}
             }
+            document.getElementById('api-key-input').value = state.apiKey || '';
+            document.getElementById('model-input').value = state.model || DEFAULT_MODEL;
+            document.getElementById('system-prompt-input').value = state.systemPrompt || '';
+        }
 
-            // Init App
+        function saveState() { 
+            safeStorageSet('universalAiChatState', JSON.stringify(state)); 
+        }
+
+        window.toggleTheme = function() {
+            state.theme = state.theme === 'dark' ? 'light' : 'dark';
+            applyTheme(); 
+            saveState();
+        };
+
+        function applyTheme() {
+            const html = document.documentElement;
+            if (state.theme === 'dark') {
+                html.classList.add('dark');
+                document.getElementById('theme-icon').className = 'fa-solid fa-sun w-5 text-center text-yellow-400';
+                document.getElementById('theme-text').textContent = 'Light Mode';
+            } else {
+                html.classList.remove('dark');
+                document.getElementById('theme-icon').className = 'fa-solid fa-moon w-5 text-center';
+                document.getElementById('theme-text').textContent = 'Dark Mode';
+            }
+        }
+
+        window.toggleSidebar = function() {
+            document.getElementById('sidebar').classList.toggle('-translate-x-full');
+            document.getElementById('sidebar-backdrop').classList.toggle('hidden');
+        };
+
+        window.openModal = function(id) { document.getElementById(id).classList.remove('hidden'); };
+        window.closeModal = function(id) { document.getElementById(id).classList.add('hidden'); };
+
+        window.autoResizeTextarea = function(el) {
+            el.style.height = 'auto';
+            el.style.height = el.scrollHeight + 'px';
+            if (el.value === '') el.style.height = '44px';
+        };
+
+        function updateModelDisplay() { 
+            document.getElementById('current-model-display').textContent = state.model || DEFAULT_MODEL; 
+        }
+
+        window.saveSettings = function() {
+            state.apiKey = document.getElementById('api-key-input').value.trim();
+            state.model = document.getElementById('model-input').value.trim() || DEFAULT_MODEL;
+            if (!state.apiKey) alert("API Key is required to send messages.");
+            saveState(); 
+            updateModelDisplay(); 
+            closeModal('settings-modal');
+        };
+
+        window.saveSystemPrompt = function() {
+            state.systemPrompt = document.getElementById('system-prompt-input').value.trim();
+            saveState(); 
+            closeModal('system-prompt-modal');
+        };
+
+        window.createNewChat = function(render = true) {
+            const newChat = { id: Date.now().toString(), title: 'New Chat', messages: [] };
+            state.chats.unshift(newChat);
+            state.currentChatId = newChat.id;
+            saveState();
+            if (render) {
+                renderChatList(); renderCurrentChat();
+                if (window.innerWidth < 768) toggleSidebar(); 
+            }
+        };
+
+        window.selectChat = function(id) {
+            if (state.isGenerating) return; 
+            state.currentChatId = id; 
+            saveState();
+            renderChatList(); 
+            renderCurrentChat();
+            if (window.innerWidth < 768) toggleSidebar();
+        };
+
+        window.deleteChat = function(id, event) {
+            event.stopPropagation();
+            if(confirm("Delete this chat?")) {
+                state.chats = state.chats.filter(c => c.id !== id);
+                if (state.currentChatId === id) state.currentChatId = state.chats.length > 0 ? state.chats[0].id : null;
+                if (!state.currentChatId) createNewChat(false);
+                saveState(); 
+                renderChatList(); 
+                renderCurrentChat();
+            }
+        };
+
+        function renderChatList() {
+            const listEl = document.getElementById('chat-list');
+            listEl.innerHTML = '';
+            state.chats.forEach(chat => {
+                const isActive = chat.id === state.currentChatId;
+                listEl.innerHTML += `
+                    <div class="group flex items-center justify-between p-2.5 rounded-lg cursor-pointer transition-colors ${isActive ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400' : 'hover:bg-gray-200 dark:hover:bg-gray-800'}" onclick="selectChat('${chat.id}')">
+                        <div class="flex items-center gap-3 overflow-hidden">
+                            <i class="fa-regular fa-message flex-shrink-0"></i>
+                            <span class="truncate text-sm font-medium">${escapeHTML(chat.title)}</span>
+                        </div>
+                        <button onclick="deleteChat('${chat.id}', event)" class="opacity-0 group-hover:opacity-100 p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-gray-500 hover:text-red-500 transition-opacity">
+                            <i class="fa-solid fa-trash text-xs"></i>
+                        </button>
+                    </div>`;
+            });
+        }
+
+        function renderCurrentChat() {
+            const chat = state.chats.find(c => c.id === state.currentChatId);
+            document.getElementById('current-chat-title').textContent = chat ? chat.title : 'New Chat';
+            document.getElementById('messages-container').querySelectorAll('.message-wrapper').forEach(m => m.remove());
+            
+            if (!chat || chat.messages.length === 0) {
+                document.getElementById('welcome-screen').style.display = 'flex';
+            } else {
+                document.getElementById('welcome-screen').style.display = 'none';
+                chat.messages.forEach(msg => appendMessageToDOM(msg.role, msg.content, false));
+                scrollToBottom();
+            }
+        }
+
+        function appendMessageToDOM(role, content, isStreaming = false) {
+            document.getElementById('welcome-screen').style.display = 'none';
+            const wrapper = document.createElement('div');
+            wrapper.className = `message-wrapper w-full flex ${role === 'user' ? 'justify-end' : 'justify-start'} max-w-3xl mx-auto`;
+            const contentId = isStreaming ? `stream-target-${Date.now()}` : '';
+
+            if (role === 'user') {
+                wrapper.innerHTML = `<div class="max-w-[85%] bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tr-sm px-5 py-3 text-[15px] shadow-sm whitespace-pre-wrap break-words border border-gray-200 dark:border-gray-700">${escapeHTML(content)}</div>`;
+            } else {
+                wrapper.innerHTML = `
+                    <div class="max-w-full md:max-w-[90%] flex gap-4 w-full">
+                        <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex-shrink-0 flex items-center justify-center shadow-sm mt-1"><i class="fa-solid fa-sparkles text-white text-xs"></i></div>
+                        <div class="flex-1 min-w-0"><div id="${contentId}" class="prose dark:prose-invert max-w-none text-[15px] text-gray-800 dark:text-gray-200 leading-relaxed ${isStreaming ? 'typing-cursor' : ''}">${isStreaming ? '' : renderMarkdown(content)}</div></div>
+                    </div>`;
+            }
+            document.getElementById('messages-container').appendChild(wrapper);
+            scrollToBottom();
+            return contentId;
+        }
+
+        function scrollToBottom() {
+            const c = document.getElementById('messages-container');
+            c.scrollTop = c.scrollHeight;
+        }
+
+        window.handleEnter = function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+        };
+
+        window.sendMessage = async function() {
+            if (state.isGenerating) return;
+            const inputEl = document.getElementById('message-input');
+            const message = inputEl.value.trim();
+            if (!message) return;
+            if (!state.apiKey) return alert("Please set your OpenRouter API Key in Settings.");
+
+            inputEl.value = ''; autoResizeTextarea(inputEl);
+            const chat = state.chats.find(c => c.id === state.currentChatId);
+            chat.messages.push({ role: 'user', content: message });
+            
+            if (chat.messages.length === 1) {
+                chat.title = message.length > 25 ? message.substring(0, 25) + '...' : message;
+                document.getElementById('current-chat-title').textContent = chat.title;
+                renderChatList();
+            }
+            saveState(); 
+            appendMessageToDOM('user', message);
+            toggleInputState(true);
+            
+            const targetId = appendMessageToDOM('assistant', '', true);
+            const targetEl = document.getElementById(targetId);
+            const apiMsgs = state.systemPrompt ? [{ role: 'system', content: state.systemPrompt }, ...chat.messages] : chat.messages;
+            state.abortController = new AbortController();
+
+            try {
+                const response = await fetch(API_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${state.apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: state.model || DEFAULT_MODEL, messages: apiMsgs, stream: true }),
+                    signal: state.abortController.signal
+                });
+
+                if (!response.ok) throw new Error(`API Error (${response.status})`);
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+                let fullContent = "", buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); 
+
+                    for (const line of lines) {
+                        if (line.trim() === '' || !line.startsWith('data: ')) continue;
+                        const dataStr = line.substring(6).trim();
+                        if (dataStr === '[DONE]') continue;
+                        try {
+                            const delta = JSON.parse(dataStr).choices?.[0]?.delta?.content;
+                            if (delta) {
+                                fullContent += delta;
+                                targetEl.innerHTML = renderMarkdown(fullContent);
+                                scrollToBottom();
+                            }
+                        } catch (e) {}
+                    }
+                }
+                targetEl.classList.remove('typing-cursor');
+                chat.messages.push({ role: 'assistant', content: fullContent });
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    chat.messages.push({ role: 'assistant', content: targetEl.innerText + "\n\n*[Stopped]*" });
+                } else {
+                    targetEl.innerHTML = `<span class="text-red-500"><i class="fa-solid fa-triangle-exclamation"></i> Error: ${err.message}</span>`;
+                    chat.messages.pop(); 
+                }
+            } finally {
+                targetEl.classList.remove('typing-cursor');
+                toggleInputState(false);
+                saveState();
+            }
+        };
+
+        window.stopGeneration = function() { 
+            if (state.abortController) state.abortController.abort(); 
+        };
+
+        function toggleInputState(isGen) {
+            state.isGenerating = isGen;
+            if (isGen) {
+                document.getElementById('send-button').classList.add('hidden');
+                document.getElementById('stop-button').classList.remove('hidden');
+            } else {
+                document.getElementById('send-button').classList.remove('hidden');
+                document.getElementById('stop-button').classList.add('hidden');
+                document.getElementById('message-input').focus();
+            }
+        }
+
+        // 5. INITIALIZE ON LOAD
+        try {
+            if (typeof marked !== 'undefined') marked.setOptions({ breaks: true, gfm: true });
             loadState();
             applyTheme();
             
@@ -209,250 +475,8 @@
             autoResizeTextarea(document.getElementById('message-input'));
 
             if (!state.apiKey) setTimeout(() => openModal('settings-modal'), 500);
-
-            // Core Functions
-            function loadState() {
-                try {
-                    const stored = localStorage.getItem('universalAiChatState');
-                    if (stored) state = { ...state, ...JSON.parse(stored) };
-                    document.getElementById('api-key-input').value = state.apiKey || '';
-                    document.getElementById('model-input').value = state.model || DEFAULT_MODEL;
-                    document.getElementById('system-prompt-input').value = state.systemPrompt || '';
-                } catch(e) {}
-            }
-
-            function saveState() { localStorage.setItem('universalAiChatState', JSON.stringify(state)); }
-
-            window.toggleTheme = function() {
-                state.theme = state.theme === 'dark' ? 'light' : 'dark';
-                applyTheme(); saveState();
-            };
-
-            function applyTheme() {
-                const html = document.documentElement;
-                if (state.theme === 'dark') {
-                    html.classList.add('dark');
-                    document.getElementById('theme-icon').className = 'fa-solid fa-sun w-5 text-center text-yellow-400';
-                    document.getElementById('theme-text').textContent = 'Light Mode';
-                } else {
-                    html.classList.remove('dark');
-                    document.getElementById('theme-icon').className = 'fa-solid fa-moon w-5 text-center';
-                    document.getElementById('theme-text').textContent = 'Dark Mode';
-                }
-            }
-
-            window.toggleSidebar = function() {
-                document.getElementById('sidebar').classList.toggle('-translate-x-full');
-                document.getElementById('sidebar-backdrop').classList.toggle('hidden');
-            };
-
-            window.openModal = function(id) { document.getElementById(id).classList.remove('hidden'); };
-            window.closeModal = function(id) { document.getElementById(id).classList.add('hidden'); };
-
-            window.autoResizeTextarea = function(el) {
-                el.style.height = 'auto';
-                el.style.height = el.scrollHeight + 'px';
-                if (el.value === '') el.style.height = '44px';
-            };
-
-            function updateModelDisplay() { document.getElementById('current-model-display').textContent = state.model || DEFAULT_MODEL; }
-
-            window.saveSettings = function() {
-                state.apiKey = document.getElementById('api-key-input').value.trim();
-                state.model = document.getElementById('model-input').value.trim() || DEFAULT_MODEL;
-                if (!state.apiKey) alert("API Key is required to send messages.");
-                saveState(); updateModelDisplay(); closeModal('settings-modal');
-            };
-
-            window.saveSystemPrompt = function() {
-                state.systemPrompt = document.getElementById('system-prompt-input').value.trim();
-                saveState(); closeModal('system-prompt-modal');
-            };
-
-            window.createNewChat = function(render = true) {
-                const newChat = { id: Date.now().toString(), title: 'New Chat', messages: [] };
-                state.chats.unshift(newChat);
-                state.currentChatId = newChat.id;
-                saveState();
-                if (render) {
-                    renderChatList(); renderCurrentChat();
-                    if (window.innerWidth < 768) toggleSidebar(); 
-                }
-            };
-
-            window.selectChat = function(id) {
-                if (state.isGenerating) return; 
-                state.currentChatId = id; saveState();
-                renderChatList(); renderCurrentChat();
-                if (window.innerWidth < 768) toggleSidebar();
-            };
-
-            window.deleteChat = function(id, event) {
-                event.stopPropagation();
-                if(confirm("Delete this chat?")) {
-                    state.chats = state.chats.filter(c => c.id !== id);
-                    if (state.currentChatId === id) state.currentChatId = state.chats.length > 0 ? state.chats[0].id : null;
-                    if (!state.currentChatId) createNewChat(false);
-                    saveState(); renderChatList(); renderCurrentChat();
-                }
-            };
-
-            function renderChatList() {
-                const listEl = document.getElementById('chat-list');
-                listEl.innerHTML = '';
-                state.chats.forEach(chat => {
-                    const isActive = chat.id === state.currentChatId;
-                    listEl.innerHTML += `
-                        <div class="group flex items-center justify-between p-2.5 rounded-lg cursor-pointer transition-colors ${isActive ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400' : 'hover:bg-gray-200 dark:hover:bg-gray-800'}" onclick="selectChat('${chat.id}')">
-                            <div class="flex items-center gap-3 overflow-hidden">
-                                <i class="fa-regular fa-message flex-shrink-0"></i>
-                                <span class="truncate text-sm font-medium">${escapeHTML(chat.title)}</span>
-                            </div>
-                            <button onclick="deleteChat('${chat.id}', event)" class="opacity-0 group-hover:opacity-100 p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-gray-500 hover:text-red-500 transition-opacity">
-                                <i class="fa-solid fa-trash text-xs"></i>
-                            </button>
-                        </div>`;
-                });
-            }
-
-            function renderCurrentChat() {
-                const chat = state.chats.find(c => c.id === state.currentChatId);
-                document.getElementById('current-chat-title').textContent = chat ? chat.title : 'New Chat';
-                document.getElementById('messages-container').querySelectorAll('.message-wrapper').forEach(m => m.remove());
-                
-                if (!chat || chat.messages.length === 0) {
-                    document.getElementById('welcome-screen').style.display = 'flex';
-                } else {
-                    document.getElementById('welcome-screen').style.display = 'none';
-                    chat.messages.forEach(msg => appendMessageToDOM(msg.role, msg.content, false));
-                    scrollToBottom();
-                }
-            }
-
-            function appendMessageToDOM(role, content, isStreaming = false) {
-                document.getElementById('welcome-screen').style.display = 'none';
-                const wrapper = document.createElement('div');
-                wrapper.className = `message-wrapper w-full flex ${role === 'user' ? 'justify-end' : 'justify-start'} max-w-3xl mx-auto`;
-                const contentId = isStreaming ? `stream-target-${Date.now()}` : '';
-
-                if (role === 'user') {
-                    wrapper.innerHTML = `<div class="max-w-[85%] bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tr-sm px-5 py-3 text-[15px] shadow-sm whitespace-pre-wrap break-words border border-gray-200 dark:border-gray-700">${escapeHTML(content)}</div>`;
-                } else {
-                    wrapper.innerHTML = `
-                        <div class="max-w-full md:max-w-[90%] flex gap-4 w-full">
-                            <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex-shrink-0 flex items-center justify-center shadow-sm mt-1"><i class="fa-solid fa-sparkles text-white text-xs"></i></div>
-                            <div class="flex-1 min-w-0"><div id="${contentId}" class="prose dark:prose-invert max-w-none text-[15px] text-gray-800 dark:text-gray-200 leading-relaxed ${isStreaming ? 'typing-cursor' : ''}">${isStreaming ? '' : renderMarkdown(content)}</div></div>
-                        </div>`;
-                }
-                document.getElementById('messages-container').appendChild(wrapper);
-                scrollToBottom();
-                return contentId;
-            }
-
-            function scrollToBottom() {
-                const c = document.getElementById('messages-container');
-                c.scrollTop = c.scrollHeight;
-            }
-
-            window.handleEnter = function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-            };
-
-            window.sendMessage = async function() {
-                if (state.isGenerating) return;
-                const inputEl = document.getElementById('message-input');
-                const message = inputEl.value.trim();
-                if (!message) return;
-                if (!state.apiKey) return alert("Please set your OpenRouter API Key in Settings.");
-
-                inputEl.value = ''; autoResizeTextarea(inputEl);
-                const chat = state.chats.find(c => c.id === state.currentChatId);
-                chat.messages.push({ role: 'user', content: message });
-                
-                if (chat.messages.length === 1) {
-                    chat.title = message.length > 25 ? message.substring(0, 25) + '...' : message;
-                    document.getElementById('current-chat-title').textContent = chat.title;
-                    renderChatList();
-                }
-                saveState(); appendMessageToDOM('user', message);
-                toggleInputState(true);
-                
-                const targetId = appendMessageToDOM('assistant', '', true);
-                const targetEl = document.getElementById(targetId);
-                const apiMsgs = state.systemPrompt ? [{ role: 'system', content: state.systemPrompt }, ...chat.messages] : chat.messages;
-                state.abortController = new AbortController();
-
-                try {
-                    const response = await fetch(API_ENDPOINT, {
-                        method: 'POST',
-                        headers: { 'Authorization': `Bearer ${state.apiKey}`, 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ model: state.model || DEFAULT_MODEL, messages: apiMsgs, stream: true }),
-                        signal: state.abortController.signal
-                    });
-
-                    if (!response.ok) throw new Error(`API Error (${response.status})`);
-
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder("utf-8");
-                    let fullContent = "", buffer = "";
-
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop(); 
-
-                        for (const line of lines) {
-                            if (line.trim() === '' || !line.startsWith('data: ')) continue;
-                            const dataStr = line.substring(6).trim();
-                            if (dataStr === '[DONE]') continue;
-                            try {
-                                const delta = JSON.parse(dataStr).choices?.[0]?.delta?.content;
-                                if (delta) {
-                                    fullContent += delta;
-                                    targetEl.innerHTML = renderMarkdown(fullContent);
-                                    scrollToBottom();
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                    targetEl.classList.remove('typing-cursor');
-                    chat.messages.push({ role: 'assistant', content: fullContent });
-                } catch (err) {
-                    if (err.name === 'AbortError') {
-                        chat.messages.push({ role: 'assistant', content: targetEl.innerText + "\n\n*[Stopped]*" });
-                    } else {
-                        targetEl.innerHTML = `<span class="text-red-500"><i class="fa-solid fa-triangle-exclamation"></i> Error: ${err.message}</span>`;
-                        chat.messages.pop(); 
-                    }
-                } finally {
-                    targetEl.classList.remove('typing-cursor');
-                    toggleInputState(false);
-                    saveState();
-                }
-            };
-
-            window.stopGeneration = function() { if (state.abortController) state.abortController.abort(); };
-
-            function toggleInputState(isGen) {
-                state.isGenerating = isGen;
-                if (isGen) {
-                    document.getElementById('send-button').classList.add('hidden');
-                    document.getElementById('stop-button').classList.remove('hidden');
-                } else {
-                    document.getElementById('send-button').classList.remove('hidden');
-                    document.getElementById('stop-button').classList.add('hidden');
-                    document.getElementById('message-input').focus();
-                }
-            }
-
-            function renderMarkdown(text) { return typeof marked !== 'undefined' ? marked.parse(text || "") : escapeHTML(text); }
-            function escapeHTML(str) { return (str || "").replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag])); }
-
-        } catch (error) {
-            console.error(error);
-            alert("A critical script error occurred. Check browser console.");
+        } catch(e) {
+            console.error("Initialization warning:", e);
         }
     </script>
 </body>
